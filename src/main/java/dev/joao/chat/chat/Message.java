@@ -1,6 +1,8 @@
 package dev.joao.chat.chat;
 
-import java.time.Instant;
+import org.springframework.data.mongodb.core.mapping.Document;
 
-public record Message(String room, String user, String text, Instant createdAt) {
+import java.time.Instant;
+@Document("messages")
+public record Message(String id, String room, String user, String text, Instant createdAt) {
 }

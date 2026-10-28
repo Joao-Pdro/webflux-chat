@@ -8,49 +8,179 @@
   body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
   #log { border: 1px solid #ccc; border-radius: 6px; height: 360px; overflow-y: auto; padding: .5rem; margin: 1rem 0; }
   #log p { margin: .25rem 0; }
-  form { display: flex; gap: .5rem; }
+  #log p.system { color: #666; font-style: italic; }
+  #online, #typing { font-size: .9rem; color: #555; min-height: 1.3em; margin: .25rem 0; }
+  form, .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
   #text { flex: 1; }
   input, button { font: inherit; padding: .4rem; }
+  #error { color: #b00020; min-height: 1.4em; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <h1>WebFlux Chat</h1>
-<label>Sala <input id="room" value="geral"></label>
-<label>Nome <input id="user" value="anon"></label>
-<button id="join">Entrar</button>
-<div id="log"></div>
-<form id="form">
-  <input id="text" placeholder="Mensagem" autocomplete="off" required>
-  <button>Enviar</button>
-</form>
+
+<section id="auth">
+  <form id="authForm">
+    <input id="username" placeholder="Usuário" autocomplete="username" required minlength="3" maxlength="30">
+    <input id="password" type="password" placeholder="Senha" autocomplete="current-password" required minlength="6" maxlength="72">
+    <button id="login">Entrar</button>
+    <button id="register" type="button">Criar conta</button>
+  </form>
+  <p id="error" role="alert"></p>
+</section>
+
+<section id="chat" hidden>
+  <div class="row">
+    <span>Olá, <b id="me"></b></span>
+    <label>Sala <input id="room" value="geral"></label>
+    <button id="join">Entrar na sala</button>
+    <button id="logout">Sair</button>
+  </div>
+  <div id="online" aria-live="polite"></div>
+  <div id="log"></div>
+  <div id="typing" aria-live="polite"></div>
+  <form id="form">
+    <input id="text" placeholder="Mensagem" autocomplete="off" required maxlength="1000" autofocus>
+    <button>Enviar</button>
+  </form>
+</section>
+
 <script>
   const $ = id => document.getElementById(id);
-  let es;
+  let token = null, abort = null;
+  let online = new Set();
+  const typingTimers = new Map(); // usuário -> timeout que apaga o "digitando…"
 
-  $('join').onclick = () => {
-    if (es) es.close();
+  // sessionStorage só como conveniência (sobreviver a F5); se bloqueado, o login vale na página
+  const store = {
+    get: () => { try { return sessionStorage.getItem('token'); } catch { return null; } },
+    set: v => { try { v ? sessionStorage.setItem('token', v) : sessionStorage.removeItem('token'); } catch {} }
+  };
+
+  const subject = t => { try { return JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).sub; } catch { return ''; } };
+  const showError = msg => $('error').textContent = msg || '';
+  const authHeaders = () => ({ 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` });
+
+  function setToken(t) {
+    token = t; store.set(t);
+    $('auth').hidden = !!t; $('chat').hidden = !t;
+    if (t) { $('me').textContent = subject(t); joinRoom(); }
+    else { if (abort) abort.abort(); $('log').textContent = ''; }
+  }
+
+  async function auth(path) {
+    showError();
+    const res = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('username').value, password: $('password').value })
+    });
+    if (res.status === 409) return showError('Usuário já existe.');
+    if (res.status === 401) return showError('Usuário ou senha inválidos.');
+    if (!res.ok) return showError('Erro ' + res.status);
+    return res;
+  }
+
+  $('authForm').onsubmit = async e => {
+    e.preventDefault();
+    const res = await auth('/auth/login');
+    if (res) { setToken((await res.json()).token); $('password').value = ''; }
+  };
+
+  $('register').onclick = async () => {
+    if (!$('authForm').reportValidity()) return;
+    if (await auth('/auth/register')) $('authForm').requestSubmit(); // cadastra e já entra
+  };
+
+  $('logout').onclick = () => setToken(null);
+  $('join').onclick = () => joinRoom();
+
+  // EventSource não envia Authorization; fetch + ReadableStream envia e o token não vai na URL
+  async function joinRoom() {
+    if (abort) abort.abort();
+    abort = new AbortController();
     $('log').textContent = '';
-    es = new EventSource(`/rooms/${encodeURIComponent($('room').value)}/stream`);
-    es.onmessage = e => {
-      const m = JSON.parse(e.data);
-      const p = document.createElement('p');
-      p.textContent = `${m.user}: ${m.text}`;
-      $('log').append(p);
-      $('log').scrollTop = $('log').scrollHeight;
-    };
+    online = new Set(); renderOnline();
+    typingTimers.forEach(clearTimeout); typingTimers.clear(); renderTyping();
+    try {
+      const res = await fetch(`/rooms/${encodeURIComponent($('room').value)}/stream`, {
+        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'text/event-stream' },
+        signal: abort.signal
+      });
+      if (res.status === 401) { setToken(null); return showError('Sessão expirada. Entre de novo.'); }
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const lines = buf.slice(0, i).split('\n');
+          buf = buf.slice(i + 2);
+          const type = (lines.find(l => l.startsWith('event:')) || 'event:message').slice(6).trim();
+          const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5)).join('\n');
+          if (data) handle(type, JSON.parse(data));
+        }
+      }
+    } catch (e) { if (e.name !== 'AbortError') showError('Conexão perdida.'); }
+  }
+
+  function handle(type, d) {
+    switch (type) {
+      case 'message':  stopTyping(d.user); line(`${d.user}: ${d.text}`); break;
+      case 'presence': online = new Set(d.users); renderOnline(); break;
+      case 'joined':   online.add(d.user); renderOnline(); line(`${d.user} entrou`, true); break;
+      case 'left':     online.delete(d.user); renderOnline(); stopTyping(d.user); line(`${d.user} saiu`, true); break;
+      case 'typing':   if (d.user !== subject(token)) showTyping(d.user); break;
+    }
+  }
+
+  function line(text, system) {
+    const p = document.createElement('p');
+    if (system) p.className = 'system';
+    p.textContent = text;
+    $('log').append(p);
+    $('log').scrollTop = $('log').scrollHeight;
+  }
+
+  const renderOnline = () => $('online').textContent = online.size ? 'Online: ' + [...online].sort().join(', ') : '';
+
+  function renderTyping() {
+    const who = [...typingTimers.keys()];
+    $('typing').textContent = !who.length ? '' : who.length === 1 ? `${who[0]} está digitando…` : `${who.join(', ')} estão digitando…`;
+  }
+  function showTyping(user) {
+    clearTimeout(typingTimers.get(user));
+    typingTimers.set(user, setTimeout(() => stopTyping(user), 3000)); // sem novo aviso em 3s, apaga
+    renderTyping();
+  }
+  function stopTyping(user) {
+    clearTimeout(typingTimers.get(user));
+    if (typingTimers.delete(user)) renderTyping();
+  }
+
+  // avisa "digitando" no máximo 1x a cada 2s
+  let lastTyping = 0;
+  $('text').oninput = () => {
+    const now = Date.now();
+    if (now - lastTyping < 2000) return;
+    lastTyping = now;
+    fetch(`/rooms/${encodeURIComponent($('room').value)}/typing`, { method: 'POST', headers: authHeaders() });
   };
 
   $('form').onsubmit = async e => {
     e.preventDefault();
-    await fetch(`/rooms/${encodeURIComponent($('room').value)}/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user: $('user').value, text: $('text').value })
+    const res = await fetch(`/rooms/${encodeURIComponent($('room').value)}/messages`, {
+      method: 'POST', headers: authHeaders(), body: JSON.stringify({ text: $('text').value })
     });
+    if (res.status === 401) { setToken(null); return showError('Sessão expirada. Entre de novo.'); }
     $('text').value = '';
+    lastTyping = 0;
   };
 
-  $('join').click();
+  const saved = store.get();
+  if (saved) setToken(saved);
 </script>
 </body>
 </html>
